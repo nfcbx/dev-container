@@ -1,0 +1,118 @@
+name: Build and Push Docker Image
+
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Parse Docker Hub repository
+        id: repo
+        run: |
+          repository='${{ vars.DOCKERHUB_REPOSITORY }}'
+          [[ "$repository" == */* ]] || { echo 'DOCKERHUB_REPOSITORY must be owner/repo' >&2; exit 1; }
+          echo "username=${repository%%/*}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ steps.repo.outputs.username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ vars.DOCKERHUB_REPOSITORY }}:latest-amd64
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Parse Docker Hub repository
+        id: repo
+        run: |
+          repository='${{ vars.DOCKERHUB_REPOSITORY }}'
+          echo "username=${repository%%/*}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ steps.repo.outputs.username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ vars.DOCKERHUB_REPOSITORY }}:latest-arm64
+
+  merge:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Parse Docker Hub repository
+        id: repo
+        run: |
+          repository='${{ vars.DOCKERHUB_REPOSITORY }}'
+          echo "username=${repository%%/*}" >> "$GITHUB_OUTPUT"
+          echo "reponame=${repository#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ steps.repo.outputs.username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ vars.DOCKERHUB_REPOSITORY }}:latest \
+            ${{ vars.DOCKERHUB_REPOSITORY }}:latest-amd64 \
+            ${{ vars.DOCKERHUB_REPOSITORY }}:latest-arm64
+
+      - name: Delete temporary tags
+        env:
+          DOCKERHUB_USERNAME: ${{ steps.repo.outputs.username }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          NS='${{ steps.repo.outputs.username }}'
+          RN='${{ steps.repo.outputs.reponame }}'
+
+          AUTH=$(curl -s -H "Content-Type: application/json" \
+            -d "{\"username\":\"$DOCKERHUB_USERNAME\",\"password\":\"$DOCKERHUB_TOKEN\"}" \
+            "https://hub.docker.com/v2/users/login/" | jq -r '.token')
+
+          for tag in latest-amd64 latest-arm64; do
+            echo "Deleting tag: $tag"
+            curl -s -o /dev/null -w "  HTTP %{http_code}\n" -X DELETE \
+              "https://hub.docker.com/v2/repositories/${NS}/${RN}/tags/${tag}/" \
+              -H "Authorization: JWT $AUTH" || true
+          done
+
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ steps.repo.outputs.username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_REPOSITORY }}
+          readme-filepath: ./README.md
